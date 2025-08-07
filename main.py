@@ -6,28 +6,40 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import threading
-from flask import Flask
+from flask import Flask, jsonify, render_template_string
 from dotenv import load_dotenv
 import os
 
 # Load environment variables
 load_dotenv()
 
-# Environment Variables
+# ENV
 URL = os.getenv("SAFE2_JOB_URL")
-NO_JOB_TEXT = os.getenv("NO_JOB_TEXT")
-IGNORE_JOB_TEXT = os.getenv("IGNORE_JOB_TEXT")
+NO_JOB_TEXT = os.getenv("NO_JOB_TEXT", "")
+IGNORE_JOB_TEXT = os.getenv("IGNORE_JOB_TEXT", "")
+ignore_keywords = [kw.strip().lower() for kw in IGNORE_JOB_TEXT.split(',') if kw.strip()]
 sender_email = os.getenv("SENDER_EMAIL")
 receiver_email = os.getenv("RECEIVER_EMAIL")
 app_password = os.getenv("EMAIL_PASSWORD")
 bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
 chat_ids = os.getenv("TELEGRAM_CHAT_IDS").split(',')
 
+# App & Alerts
+app = Flask(__name__)
+recent_alerts = []
+
 def log_event(msg):
     print(f"[{datetime.now()}] {msg}")
 
+def save_alert(message):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    recent_alerts.append({'time': timestamp, 'message': message})
+    if len(recent_alerts) > 20:
+        recent_alerts.pop(0)
+
 def send_telegram_alert():
-    message = "🚨 A new job has been posted on Safe2. Check your portal now: {}".format(URL)
+    message = f"🚨 A new job has been posted on Safe2. Check your portal now: {URL}"
+    save_alert(message)
 
     for chat_id in chat_ids:
         try:
@@ -66,10 +78,10 @@ def check_for_job_change():
     try:
         response = requests.get(URL, headers=headers)
         soup = BeautifulSoup(response.content, 'html.parser')
-        full_text = soup.get_text(separator=' ', strip=True)
+        full_text = soup.get_text(separator=' ', strip=True).lower()
 
-        if NO_JOB_TEXT not in full_text:
-            if IGNORE_JOB_TEXT in full_text:
+        if NO_JOB_TEXT.lower() not in full_text:
+            if any(keyword in full_text for keyword in ignore_keywords):
                 log_event("⚠️ Ignored job detected. No notification sent.")
                 return False
 
@@ -86,21 +98,33 @@ def check_for_job_change():
         log_event(f"❌ Error checking site: {e}")
         return False
 
-# Background thread for checking job
 def start_job_checker():
     while True:
         check_for_job_change()
         time.sleep(30)
 
-# Start thread
+# Start background thread
 threading.Thread(target=start_job_checker, daemon=True).start()
 
-# Flask web server to stay alive
-app = Flask(__name__)
-
+# Flask routes
 @app.route("/")
 def home():
     return "✅ Safe2 Job Notifier is running and alive."
+
+@app.route("/alerts")
+def alerts():
+    html = """
+    <html><head><title>Recent Alerts</title></head>
+    <body>
+    <h2>📋 Recent Job Alerts</h2>
+    <ul>
+        {% for alert in alerts %}
+            <li><strong>{{ alert.time }}</strong>: {{ alert.message }}</li>
+        {% endfor %}
+    </ul>
+    </body></html>
+    """
+    return render_template_string(html, alerts=recent_alerts)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
