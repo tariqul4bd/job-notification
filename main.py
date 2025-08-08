@@ -1,97 +1,126 @@
+import os
+import re
+import time
+import smtplib
+import threading
 import requests
 from bs4 import BeautifulSoup
-import time
 from datetime import datetime
-import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import threading
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, render_template_string
 from dotenv import load_dotenv
-import os
 
 # Load environment variables
 load_dotenv()
 
-# ENV
+# ===== ENV =====
 URL = os.getenv("SAFE2_JOB_URL")
 NO_JOB_TEXT = os.getenv("NO_JOB_TEXT", "")
 IGNORE_JOB_TEXT = os.getenv("IGNORE_JOB_TEXT", "")
-ignore_keywords = [kw.strip().lower() for kw in IGNORE_JOB_TEXT.split(',') if kw.strip()]
-sender_email = os.getenv("SENDER_EMAIL")
-receiver_email = os.getenv("RECEIVER_EMAIL")
-app_password = os.getenv("EMAIL_PASSWORD")
-bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-chat_ids = os.getenv("TELEGRAM_CHAT_IDS").split(',')
+SENDER = os.getenv("SENDER_EMAIL")
+RECEIVER = os.getenv("RECEIVER_EMAIL")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
 
-# App & Alerts
+# Ignore list (postcodes), normalized to uppercase
+IGNORED_POSTCODES = {pc.strip().upper() for pc in IGNORE_JOB_TEXT.split(",") if pc.strip()}
+
+# Simple UK postcode regex (good enough for alerts)
+UK_PC_RE = r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b"
+
+# ===== App & in-memory alert log =====
 app = Flask(__name__)
-recent_alerts = []
+recent_alerts = []   # [{'time': 'yyyy-mm-dd hh:mm:ss', 'message': '...'}]
+MAX_LOG = 20
 
 def log_event(msg):
-    print(f"[{datetime.now()}] {msg}")
+    print(f"[{datetime.now()}] {msg}", flush=True)
 
 def save_alert(message):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    recent_alerts.append({'time': timestamp, 'message': message})
-    if len(recent_alerts) > 20:
+    recent_alerts.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "message": message})
+    if len(recent_alerts) > MAX_LOG:
         recent_alerts.pop(0)
 
-def send_telegram_alert():
-    message = f"🚨 A new job has been posted on Safe2. Check your portal now: {URL}"
+# ===== Notifiers =====
+def send_telegram_alert(message):
     save_alert(message)
-
-    for chat_id in chat_ids:
+    for chat_id in CHAT_IDS:
         try:
-            url_telegram = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            data = {'chat_id': chat_id.strip(), 'text': message}
-            response = requests.post(url_telegram, data=data)
-            if response.status_code == 200:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": chat_id, "text": message},
+                timeout=15,
+            )
+            if resp.status_code == 200:
                 log_event(f"📲 Telegram alert sent to {chat_id}")
             else:
-                log_event(f"❌ Telegram alert failed for {chat_id}. Status: {response.status_code}")
+                log_event(f"❌ Telegram alert failed ({resp.status_code}) for {chat_id}")
         except Exception as e:
             log_event(f"❌ Telegram error for {chat_id}: {e}")
 
-def send_email_notification():
+def send_email_notification(message):
     subject = "✅ New Safe2 Job Available!"
-    body = f"A new job has been posted on Safe2. Check your portal now: {URL}"
+    body = f"{message}\n\nView it here: {URL}"
 
     msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = receiver_email
+    msg["From"] = SENDER
+    msg["To"] = RECEIVER
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
         server.starttls()
-        server.login(sender_email, app_password)
-        server.sendmail(sender_email, receiver_email, msg.as_string())
+        server.login(SENDER, EMAIL_PASSWORD)
+        server.sendmail(SENDER, RECEIVER, msg.as_string())
         server.quit()
         log_event("📧 Email sent successfully.")
     except Exception as e:
         log_event(f"❌ Email error: {e}")
 
+# ===== Core checker =====
 def check_for_job_change():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {"User-Agent": "Mozilla/5.0 (Safe2 Job Notifier)"}
     try:
-        response = requests.get(URL, headers=headers)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        full_text = soup.get_text(separator=' ', strip=True).lower()
+        resp = requests.get(URL, headers=headers, timeout=30)
+        soup = BeautifulSoup(resp.content, "html.parser")
+        full_text_raw = soup.get_text(separator=" ", strip=True)
 
-        if NO_JOB_TEXT.lower() not in full_text:
-            if any(keyword in full_text for keyword in ignore_keywords):
-                log_event("⚠️ Ignored job detected. No notification sent.")
-                return False
+        # If the explicit "no jobs" banner is there, do nothing
+        if NO_JOB_TEXT and NO_JOB_TEXT in full_text_raw:
+            log_event("🔄 Still same message. Will check again.")
+            return False
 
-            log_event("🚨 New job found!")
-            send_email_notification()
-            send_telegram_alert()
-            log_event("✅ New job posted. Alerts sent.")
+        # Extract all postcodes that appear on the page
+        found_pcs = {
+            m.group(1).upper().replace("  ", " ").strip()
+            for m in re.finditer(UK_PC_RE, full_text_raw, flags=re.I)
+        }
+
+        # If we found no postcodes but the "no jobs" banner isn't there,
+        # treat it as potential new job to avoid missing anything.
+        if not found_pcs:
+            log_event("⚠️ No postcodes found but 'no jobs' banner missing. Sending alert just in case.")
+            message = f"🚨 New job detected (no postcode parsed). Check your portal: {URL}"
+            send_email_notification(message)
+            send_telegram_alert(message)
+            return True
+
+        # Filter out ignored postcodes; alert if at least one non-ignored is present
+        non_ignored = sorted(pc for pc in found_pcs if pc not in IGNORED_POSTCODES)
+
+        if non_ignored:
+            pcs_str = ", ".join(non_ignored)
+            log_event(f"🚨 New job(s) found for postcodes: {pcs_str}")
+            message = f"🚨 New job(s) found: {pcs_str}\nCheck your portal: {URL}"
+            send_email_notification(message)
+            send_telegram_alert(message)
+            log_event("✅ Alerts sent.")
             return True
         else:
-            log_event("🔄 Still same message. Will check again.")
+            log_event(f"⚠️ Only ignored postcodes present: {', '.join(sorted(found_pcs))}. No notification sent.")
             return False
 
     except Exception as e:
@@ -99,14 +128,17 @@ def check_for_job_change():
         return False
 
 def start_job_checker():
+    log_event("✅ Job checker loop started.")
     while True:
         check_for_job_change()
         time.sleep(30)
 
-# Start background thread
-threading.Thread(target=start_job_checker, daemon=True).start()
+# Start checker reliably on Render after the first web request
+@app.before_first_request
+def activate_job_checker():
+    threading.Thread(target=start_job_checker, daemon=True).start()
 
-# Flask routes
+# ===== Flask routes =====
 @app.route("/")
 def home():
     return "✅ Safe2 Job Notifier is running and alive."
@@ -115,13 +147,14 @@ def home():
 def alerts():
     html = """
     <html><head><title>Recent Alerts</title></head>
-    <body>
-    <h2>📋 Recent Job Alerts</h2>
-    <ul>
-        {% for alert in alerts %}
-            <li><strong>{{ alert.time }}</strong>: {{ alert.message }}</li>
+    <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+      <h2>📋 Recent Job Alerts</h2>
+      <ul>
+        {% for a in alerts %}
+          <li><strong>{{ a.time }}</strong>: {{ a.message }}</li>
         {% endfor %}
-    </ul>
+      </ul>
+      {% if not alerts %}<p>No alerts yet.</p>{% endif %}
     </body></html>
     """
     return render_template_string(html, alerts=recent_alerts)
