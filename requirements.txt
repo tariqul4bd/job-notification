@@ -1,4 +1,6 @@
+Flask
 requests
 beautifulsoup4
-Flask
+pytz
 python-dotenv
+
