@@ -10,21 +10,44 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template_string
 from dotenv import load_dotenv
+from threading import Thread
+
+from datetime import datetime, time as dt_time
+import pytz
+
+
+def is_within_allowed_time():
+    london = pytz.timezone("Europe/London")
+    now = datetime.now(london).time()
+    start = dt_time(6, 30)   # 06:00 AM
+    end = dt_time(23, 0)    # 11:00 PM
+    return start <= now <= end
+
+
+
 
 # ---------------- env ----------------
+
+# Load environment variables
 load_dotenv()
+
+# Other settings
+CHECK_INTERVAL = 30  # ✅ Add this line
 
 URL = os.getenv("SAFE2_JOB_URL")
 NO_JOB_TEXT = os.getenv("NO_JOB_TEXT", "")
 IGNORE_JOB_TEXT = os.getenv("IGNORE_JOB_TEXT", "")
+IGNORE_SERVICES = os.getenv("IGNORE_SERVICES", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
 
+
 # Normalize ignored postcodes (case-insensitive)
 IGNORED_POSTCODES = {pc.strip().upper() for pc in IGNORE_JOB_TEXT.split(",") if pc.strip()}
+IGNORE_SERVICES = {pc.strip().upper() for pc in os.getenv("IGNORE_SERVICES", "").split(",") if pc.strip()}
 
 # Simple UK postcode regex (good enough for alerts)
 UK_PC_RE = r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b"
@@ -82,65 +105,85 @@ def send_email_notification(message: str):
     except Exception as e:
         log_event(f"❌ Email error: {e}")
 
+
+# ✅ GLOBAL toggle
+# ---------------- global job state ----------------
+active_jobs = set()
+is_paused = False
 # ---------------- core checker ----------------
 def check_for_job_change():
+    global active_jobs
     headers = {"User-Agent": "Mozilla/5.0 (Safe2 Job Notifier)"}
+
     try:
         resp = requests.get(URL, headers=headers, timeout=30)
         soup = BeautifulSoup(resp.content, "html.parser")
-        full_text_raw = soup.get_text(separator=" ", strip=True)
 
-        # If explicit "no jobs" banner is present, nothing to do
-        if NO_JOB_TEXT and NO_JOB_TEXT in full_text_raw:
-            log_event("🔄 Still same message. Will check again.")
+        full_text_raw = soup.get_text(separator=" ", strip=True).upper()
+
+        if NO_JOB_TEXT and NO_JOB_TEXT.upper() in full_text_raw:
+            if active_jobs:
+                log_event("✅ Jobs cleared (picked up).")
+                active_jobs.clear()
             return False
 
-        # Extract all postcodes from the page
+        # 🔴 Ignore jobs by service name (e.g., EPC)
+        if any(service in full_text_raw for service in IGNORE_SERVICES):
+            log_event(f"❌ Ignored job based on service: matched one of {IGNORE_SERVICES}")
+            return False
+
+
+
+        # ✅ Extract postcodes
         found_pcs = {
             m.group(1).upper().replace("  ", " ").strip()
             for m in re.finditer(UK_PC_RE, full_text_raw, flags=re.I)
         }
-        log_event(f"🔎 Postcodes on page: {', '.join(sorted(found_pcs)) or 'none'}")
 
-        # If no postcodes parsed but "no jobs" text is also missing, alert just in case
-        if not found_pcs:
-            message = f"🚨 New job detected (no postcode parsed). Check your portal: {URL}"
-            log_event("⚠️ No postcodes parsed; sending cautious alert.")
-            send_email_notification(message)
-            send_telegram_alert(message)
-            return True
-
-        # Only suppress if *all* postcodes are ignored.
         non_ignored = sorted(pc for pc in found_pcs if pc not in IGNORED_POSTCODES)
+
         if non_ignored:
-            pcs_str = ", ".join(non_ignored)
-            message = f"🚨 New job(s) found: {pcs_str}\nCheck your portal: {URL}"
-            log_event(f"🚨 New job(s) found for postcodes: {pcs_str}")
+            new_jobs = set(non_ignored)
+
+            if new_jobs != active_jobs:
+                log_event(f"🚨 New or changed jobs: {', '.join(new_jobs)}")
+                active_jobs = new_jobs  # store current jobs
+            else:
+                log_event(f"🔁 Re-alerting same job(s): {', '.join(active_jobs)}")
+
+            message = f"🚨 Safe2 Job(s): {', '.join(active_jobs)}\nCheck portal: {URL}"
             send_email_notification(message)
             send_telegram_alert(message)
-            log_event("✅ Alerts sent.")
             return True
-
-        log_event(f"⚠️ Only ignored postcodes present: {', '.join(sorted(found_pcs))}. No notification sent.")
-        return False
+        else:
+            if active_jobs:
+                log_event("✅ Previously found jobs now cleared.")
+                active_jobs.clear()
+            log_event("⚠️ No valid jobs to notify.")
+            return False
 
     except Exception as e:
         log_event(f"❌ Error checking site: {e}")
         return False
 
-def start_job_checker():
-    log_event("✅ Job checker loop started.")
-    while True:
-        check_for_job_change()
-        time.sleep(30)
 
-# Start the checker immediately (Flask 3.x friendly)
-threading.Thread(target=start_job_checker, daemon=True).start()
 
-# ---------------- routes ----------------
-@app.route("/")
-def home():
-    return "✅ Safe2 Job Notifier is running and alive."
+
+
+
+
+
+
+
+
+@app.route("/app")
+def toggle_bot():
+    global is_paused
+    is_paused = not is_paused
+    state = "paused" if is_paused else "running"
+    return f"<h2>✅ Job checker is now <b>{state.upper()}</b>.</h2><a href='/alerts'>🔙 View Alerts</a>"
+
+
 
 @app.route("/alerts")
 def alerts():
@@ -159,5 +202,20 @@ def alerts():
     return render_template_string(html, alerts=recent_alerts)
 
 # ---------------- run ----------------
+# ---------------- run ----------------
+def start_job_checker():
+    global is_paused
+    log_event("✅ Job checker loop started.")
+    while True:
+        if not is_paused and is_within_allowed_time():
+            check_for_job_change()
+        elif not is_within_allowed_time():
+            log_event("⏰ Outside allowed time range, skipping check.")
+        time.sleep(CHECK_INTERVAL)
+
+
 if __name__ == "__main__":
+    Thread(target=start_job_checker, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
+
+
