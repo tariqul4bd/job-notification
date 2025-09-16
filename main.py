@@ -9,7 +9,7 @@ import threading
 from flask import Flask
 
 # Safe2 Job Page URL
-URL = "https://portal.safe2.co.uk/trade/8483/ZKfVPrdTaL59/your"
+URL = "https://portal.safe2.co.uk/trade/8483/ZKfVPrdTaL59/new"
 NO_JOB_TEXT = "Sorry, all jobs have currently be taken in your area. We will contact you when we receive more jobs."
 IGNORE_JOB_TEXT = "22 Edgefield, West Allotment, Newcastle upon Tyne, NE27 0BT, Newcastle upon Tyne, NE27 0BT"
 
